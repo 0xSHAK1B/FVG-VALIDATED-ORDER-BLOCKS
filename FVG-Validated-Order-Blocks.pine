@@ -11,10 +11,8 @@
 //  ORIGIN-MOST one (deepest, at the base of the impulse).
 // =============================================================================
 indicator("FVG Validated Order Blocks", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
-
-// =============================================================================
-//                                   INPUTS
-// =============================================================================
+                                 
+// ==============================[INPUTS]================================
 gS = "1) Structure / Impulse"
 pivotLen   = input.int(5, "Swing Pivot Length", minval = 1, maxval = 50, group = gS,
      tooltip = "Bars left/right to confirm a swing. Swings delimit impulse legs and trigger OB detection.")
