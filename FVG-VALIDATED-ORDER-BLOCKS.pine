@@ -1,0 +1,569 @@
+//@version=5
+// =============================================================================
+//  FVG Validated Order Blocks
+// -----------------------------------------------------------------------------
+//  Developer : MUHAMMAD SHAKIB
+//  GitHub    : https://github.com/0xSHAK1B
+//  Telegram  : https://t.me/MUH4MM4DSH4KIB
+// =============================================================================
+//  An Order Block is the candle that ANCHORS a Fair Value Gap running away from
+//  it. In an impulsive move many FVGs form up the leg; the CORRECT OB is the
+//  ORIGIN-MOST one (deepest, at the base of the impulse).
+// =============================================================================
+indicator("FVG Validated Order Blocks", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+//                                   INPUTS
+// =============================================================================
+gS = "1) Structure / Impulse"
+pivotLen   = input.int(5, "Swing Pivot Length", minval = 1, maxval = 50, group = gS,
+     tooltip = "Bars left/right to confirm a swing. Swings delimit impulse legs and trigger OB detection.")
+maxSwings  = input.int(6, "Max Swings Tracked", minval = 1, maxval = 20, group = gS,
+     tooltip = "How many recent swing highs / lows are kept so clustered swings each get their own OB. Higher = catches more OBs in choppy tops/bottoms; keep modest to avoid clutter.")
+maxLeg     = input.int(120, "Max Impulse Leg Lookback (bars)", minval = 5, maxval = 480, group = gS,
+     tooltip = "How far back the script keeps FVGs / candles / swings for OB selection.")
+minDispATR = input.float(0.0, "Min Impulse Displacement (ATR)", minval = 0, maxval = 10, step = 0.1, group = gS,
+     tooltip = "Suppresses MINOR order blocks by requiring the swing's leg to span at least this many ATRs. 0 = off. On Monthly, raise to ~1.5–3.")
+confirmBar = input.bool(true, "Wait for Bar Close (no repaint)", group = gS,
+     tooltip = "ON: structure, FVGs and mitigation are evaluated only on closed bars.")
+
+gD = "2) Detection Mode"
+detectMode = input.string("First FVG off Swing", "Detection Trigger", options = ["First FVG off Swing", "Structure Break (BOS)"], group = gD,
+     tooltip = "'First FVG off Swing' = on each confirmed swing, mark the OB at the ORIGIN-MOST FVG of the leg (deepest, at the base of the impulse). 'Structure Break (BOS)' = original strict spec; an OB is only sought after price CLOSES beyond a tracked swing.")
+obFallback = input.bool(true, "Show Unvalidated OBs (BOS mode only)", group = gD,
+     tooltip = "BOS mode only: if a break leg has NO validating FVG, fall back to the STANDARD order block (last opposite-color candle) with a DASHED border.")
+debugMode  = input.bool(false, "Debug: show FVGs, swings & BOS", group = gD,
+     tooltip = "Plots every detected FVG (triangles), confirmed swings (circles) and BOS events (labels).")
+
+gOB = "3) Order Block Boxes"
+obBullCol = input.color(color.new(#0b1f66, 65), "Bullish OB Fill", group = gOB)
+obBearCol = input.color(color.new(#5c0b1f, 65), "Bearish OB Fill", group = gOB)
+obBorder  = input.color(color.new(#3b5bdb, 0),  "Bullish OB Border", group = gOB)
+obBearBd  = input.color(color.new(#d6336c, 0),  "Bearish OB Border", group = gOB)
+obWidth   = input.int(1, "OB Border Width", minval = 0, maxval = 4, group = gOB)
+showMid   = input.bool(true, "Show 50% (Equilibrium) Line", group = gOB,
+     tooltip = "Draws a line at the midpoint (mean threshold) of each OB — the 50% retracement level of the block.")
+midStyle  = input.string("Dashed", "50% Line Style", options = ["Solid", "Dashed", "Dotted"], group = gOB)
+midWidth  = input.int(1, "50% Line Width", minval = 1, maxval = 4, group = gOB)
+
+gL = "4) Labels"
+showLabels = input.bool(false, "Show OB / FVG Labels", group = gL,
+     tooltip = "Writes 'OB' inside each order block and 'FVG' inside each gap. Text persists (greyed) after mitigation. OFF by default.")
+labelOff   = input.int(20, "Label Offset (bars right of anchor)", minval = 0, maxval = 100, group = gL,
+     tooltip = "How many bars right of the OB candle the centered label sits, so the text clears the candle and stays inside the zone.")
+labelSize  = input.string("Normal", "Label Size", options = ["Tiny", "Small", "Normal", "Large"], group = gL)
+obTxtCol   = input.color(color.white, "OB Text Color",  group = gL)
+fvgTxtCol  = input.color(color.white, "FVG Text Color", group = gL)
+
+gF = "5) FVG Boxes"
+showFVG    = input.bool(false, "Show FVG Confluence Boxes", group = gF,
+     tooltip = "Draws the purple FVG box adjacent to each ACTIVE OB. OFF by default. Note: 'Show Mitigated FVG' (group 6) is independent of this and can still draw greyed FVG boxes on spent zones.")
+fvgBullCol = input.color(color.new(#6741d9, 70), "Bullish FVG Fill", group = gF)
+fvgBearCol = input.color(color.new(#6741d9, 70), "Bearish FVG Fill", group = gF)
+fvgBorder  = input.color(color.new(#9775fa, 0),  "FVG Border",       group = gF)
+fvgWidth   = input.int(1, "FVG Border Width", minval = 0, maxval = 4, group = gF)
+
+gM = "6) Mitigation"
+showMitig = input.bool(false, "Show Mitigated Blocks", group = gM,
+     tooltip = "Master switch. ON: keep invalidated blocks (frozen + grayed), subject to the two toggles below. OFF (default): delete them when mitigated for a cleaner chart.")
+showMitOB  = input.bool(true, "Show Mitigated OB", group = gM,
+     tooltip = "When Show Mitigated Blocks is ON: keep (true) or hide (false) the mitigated ORDER BLOCK boxes specifically.")
+showMitFVG = input.bool(true, "Show Mitigated FVG", group = gM,
+     tooltip = "Show the greyed FVG box on mitigated zones. INDEPENDENT of 'Show FVG Confluence Boxes' — works even when live FVG boxes are hidden, so you can keep active zones clean but still see the gap on spent ones.")
+mitMode   = input.string("50% Touch", "Mitigation Trigger", options = ["Close Through", "Wick Touch", "50% Touch"], group = gM,
+     tooltip = "'Close Through' = candle must CLOSE beyond the far edge. 'Wick Touch' = price first trades back INTO the zone (near edge). '50% Touch' = price reaches the OB midpoint / equilibrium (bull: low <= 50%; bear: high >= 50%).")
+mitOBCol  = input.color(color.new(color.gray, 80), "Mitigated OB Fill",  group = gM)
+mitFVGCol = input.color(color.new(color.gray, 88), "Mitigated FVG Fill", group = gM)
+maxOBs    = input.int(20, "Max Order Blocks Kept", minval = 1, maxval = 100, group = gM,
+     tooltip = "Caps retained blocks (active + mitigated) to keep the chart responsive.")
+
+gW = "7) Watermark / Credit"
+wmPos    = input.string("Bottom Right", "Watermark Position", options = ["Bottom Right", "Bottom Left", "Top Right", "Top Left"], group = gW,
+     tooltip = "Corner for the developer credit. The watermark itself is permanent and cannot be hidden.")
+
+// ============================[PERSISTENT STATE]================================
+// --- Rolling swing lists (newest pushed last). ---
+var shPrice = array.new<float>()
+var shBar   = array.new<int>()
+var shDone  = array.new<bool>()
+var shBrk   = array.new<bool>()
+var slPrice = array.new<float>()
+var slBar   = array.new<int>()
+var slDone  = array.new<bool>()
+var slBrk   = array.new<bool>()
+
+// --- Rolling FVG memory (chronological: index 0 = oldest) ---
+var fAnchor = array.new<int>()
+var fBull   = array.new<bool>()
+var fGapTop = array.new<float>()
+var fGapBot = array.new<float>()
+var fObTop  = array.new<float>()
+var fObBot  = array.new<float>()
+var fMit    = array.new<bool>()
+var fMitBar = array.new<int>()
+
+// --- Rolling candle memory (standard-OB fallback; chronological) ---
+var cBar   = array.new<int>()
+var cBull  = array.new<bool>()
+var cHigh  = array.new<float>()
+var cLow   = array.new<float>()
+var cClose = array.new<float>()
+
+// --- Active / drawn Order Blocks (all 13 arrays kept in sync) ---
+var obBox   = array.new<box>()
+var fvBox   = array.new<box>()
+var obMid   = array.new<line>()
+var obLbl   = array.new<label>()
+var fvLbl   = array.new<label>()
+var obBull  = array.new<bool>()
+var obTop   = array.new<float>()
+var obBot   = array.new<float>()
+var obAct   = array.new<bool>()
+var obBar   = array.new<int>()
+var obGapT  = array.new<float>()
+var obGapB  = array.new<float>()
+var obValid = array.new<bool>()
+
+// ==============================[FUNCTIONS]==============================
+f_lineStyle(string s) =>
+    s == "Solid" ? line.style_solid : s == "Dotted" ? line.style_dotted : line.style_dashed
+
+f_lblSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Large" ? size.large : size.normal
+
+f_wmPos(string s) =>
+    s == "Bottom Left" ? position.bottom_left : s == "Top Right" ? position.top_right : s == "Top Left" ? position.top_left : position.bottom_right
+
+// ORIGIN-MOST FVG of the given direction whose anchor sits at/after the origin.
+f_findOB(bool isBull, int originBar) =>
+    bestIdx = -1
+    int bestBar = na
+    int n   = array.size(fAnchor)
+    if n > 0
+        for i = 0 to n - 1
+            if (array.get(fBull, i) == isBull) and (array.get(fAnchor, i) >= originBar)
+                ab = array.get(fAnchor, i)
+                if na(bestBar) or ab < bestBar
+                    bestBar := ab
+                    bestIdx := i
+    bestIdx
+
+// Standard-OB fallback: most-recent opposite-color candle in [originBar, now].
+f_findStdOB(bool isBull, int originBar) =>
+    bestIdx = -1
+    int bestBar = na
+    int n   = array.size(cBar)
+    if n > 0
+        for i = 0 to n - 1
+            cb = array.get(cBar, i)
+            if cb >= originBar
+                opp = isBull ? (not array.get(cBull, i)) : array.get(cBull, i)
+                if opp and (na(bestBar) or cb > bestBar)
+                    bestBar := cb
+                    bestIdx := i
+    bestIdx
+
+// Scan candle store for the first bar after `aBar` that mitigates a level (mode-aware).
+f_scanMit(bool isBull, int aBar, float oBot, float oTop) =>
+    mit = false
+    int mitBar = na
+    int n = array.size(cBar)
+    if n > 0
+        for i = 0 to n - 1
+            cb = array.get(cBar, i)
+            if cb > aBar and not mit
+                vMid = math.avg(oBot, oTop)
+                v = mitMode == "50% Touch" ? (isBull ? array.get(cLow, i) <= vMid : array.get(cHigh, i) >= vMid) : mitMode == "Wick Touch" ? (isBull ? array.get(cLow, i) <= oTop : array.get(cHigh, i) >= oBot) : (isBull ? array.get(cClose, i) < oBot : array.get(cClose, i) > oTop)
+                if v
+                    mit    := true
+                    mitBar := cb
+    [mit, mitBar]
+
+// Register an OB. Returns true if a row was created (passed de-dupe). Geometry is
+// always stored so a mitigated FVG box can be drawn later even if group 5 is off.
+f_registerOB(bool isBull, int aBar, float oTop, float oBot, float gTop, float gBot, bool valid, bool preMit, int preMitBar) =>
+    dup = false
+    if array.size(obBar) > 0
+        for j = 0 to array.size(obBar) - 1
+            if array.get(obBar, j) == aBar
+                dup := true
+
+    created = false
+    if not dup and not (preMit and not showMitig)
+        rightEdge = preMit ? preMitBar : bar_index
+        ext       = preMit ? extend.none : extend.right
+        obFill    = preMit ? mitOBCol : (isBull ? obBullCol : obBearCol)
+        obBord    = preMit ? color.new(mitOBCol, 60) : (isBull ? obBorder : obBearBd)
+        bStyle    = valid ? line.style_solid : line.style_dashed
+        lblX      = aBar + labelOff
+
+        drawOB  = not preMit or showMitOB
+        // Live FVG drawn only if group 5 on. Mitigated FVG drawn if its toggle on (independent).
+        drawFVG = valid and (preMit ? showMitFVG : showFVG)
+
+        box bxo = na
+        if drawOB
+            bxo := box.new(aBar, oTop, rightEdge, oBot, border_color = obBord,
+                 border_width = obWidth, border_style = bStyle, bgcolor = obFill, extend = ext)
+
+        box bxf = na
+        if drawFVG
+            fvFill = preMit ? mitFVGCol : (isBull ? fvgBullCol : fvgBearCol)
+            fvBord = preMit ? color.new(mitFVGCol, 70) : fvgBorder
+            bxf := box.new(aBar, gTop, rightEdge, gBot, border_color = fvBord,
+                 border_width = fvgWidth, bgcolor = fvFill, extend = ext)
+
+        mid = math.avg(oTop, oBot)
+        line lnM = na
+        if showMid and drawOB
+            lnCol = preMit ? color.new(mitOBCol, 40) : (isBull ? obBorder : obBearBd)
+            lnM := line.new(aBar, mid, rightEdge, mid, color = lnCol, width = midWidth, style = f_lineStyle(midStyle), extend = ext)
+
+        label lOB = na
+        if showLabels and drawOB
+            obTc = preMit ? color.new(obTxtCol, 45) : obTxtCol
+            lOB := label.new(lblX, mid, "OB", style = label.style_label_center, textcolor = obTc, color = color.new(color.black, 100), size = f_lblSize(labelSize))
+        label lFV = na
+        if showLabels and drawFVG
+            fvMid = math.avg(gTop, gBot)
+            fvTc  = preMit ? color.new(fvgTxtCol, 45) : fvgTxtCol
+            lFV := label.new(lblX, fvMid, "FVG", style = label.style_label_center, textcolor = fvTc, color = color.new(color.black, 100), size = f_lblSize(labelSize))
+
+        // Register if anything drew, OR if it's an active valid OB whose FVG might
+        // need drawing later at mitigation (so we keep the geometry alive).
+        if drawOB or drawFVG or (not preMit and valid)
+            array.push(obBox, bxo)
+            array.push(fvBox, bxf)
+            array.push(obMid, lnM)
+            array.push(obLbl, lOB)
+            array.push(fvLbl, lFV)
+            array.push(obBull, isBull)
+            array.push(obTop, oTop)
+            array.push(obBot, oBot)
+            array.push(obAct, not preMit)
+            array.push(obBar, aBar)
+            array.push(obGapT, gTop)
+            array.push(obGapB, gBot)
+            array.push(obValid, valid)
+            created := true
+    created
+
+// =========================[STRUCTURE DETECTION]=============================
+atrVal = ta.atr(14)
+
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+
+// Push new swings onto the rolling lists (cap to maxSwings, oldest out).
+if not na(ph)
+    array.push(shPrice, ph)
+    array.push(shBar, bar_index - pivotLen)
+    array.push(shDone, false)
+    array.push(shBrk, false)
+    while array.size(shPrice) > maxSwings
+        array.shift(shPrice), array.shift(shBar), array.shift(shDone), array.shift(shBrk)
+if not na(pl)
+    array.push(slPrice, pl)
+    array.push(slBar, bar_index - pivotLen)
+    array.push(slDone, false)
+    array.push(slBrk, false)
+    while array.size(slPrice) > maxSwings
+        array.shift(slPrice), array.shift(slBar), array.shift(slDone), array.shift(slBrk)
+
+bool dbgBOSbull = false
+bool dbgBOSbear = false
+
+// =======================[MAIN LOGIC]===================================
+proc = confirmBar ? barstate.isconfirmed : true
+
+if proc
+    // ---- 1) Record completed FVGs
+    bullFVGnow = low > high[2]
+    bearFVGnow = high < low[2]
+    if bullFVGnow
+        array.push(fAnchor, bar_index - 2)
+        array.push(fBull,   true)
+        array.push(fGapTop, low)
+        array.push(fGapBot, high[2])
+        array.push(fObTop,  high[2])
+        array.push(fObBot,  low[2])
+        array.push(fMit,    false)
+        array.push(fMitBar, na)
+    if bearFVGnow
+        array.push(fAnchor, bar_index - 2)
+        array.push(fBull,   false)
+        array.push(fGapTop, low[2])
+        array.push(fGapBot, high)
+        array.push(fObTop,  high[2])
+        array.push(fObBot,  low[2])
+        array.push(fMit,    false)
+        array.push(fMitBar, na)
+
+    // ---- 1a) Record this candle (fallback source)
+    array.push(cBar,   bar_index)
+    array.push(cBull,  close > open)
+    array.push(cHigh,  high)
+    array.push(cLow,   low)
+    array.push(cClose, close)
+
+    // ---- 1b) LIVE mitigation tracking for EVERY stored FVG (mode-aware)
+    if array.size(fAnchor) > 0
+        for k = 0 to array.size(fAnchor) - 1
+            if not array.get(fMit, k)
+                kBull = array.get(fBull, k)
+                kTop  = array.get(fObTop, k)
+                kBot  = array.get(fObBot, k)
+                kMid  = math.avg(kBot, kTop)
+                viol  = mitMode == "50% Touch" ? (kBull ? low <= kMid : high >= kMid) : mitMode == "Wick Touch" ? (kBull ? low <= kTop : high >= kBot) : (kBull ? close < kBot : close > kTop)
+                if viol
+                    array.set(fMit, k, true)
+                    array.set(fMitBar, k, bar_index)
+
+    // ---- 2) Prune FVG + candle + swing stores outside the lookback window
+    cutoff = bar_index - maxLeg
+    while array.size(fAnchor) > 0
+        if array.get(fAnchor, 0) < cutoff
+            array.shift(fAnchor)
+            array.shift(fBull)
+            array.shift(fGapTop)
+            array.shift(fGapBot)
+            array.shift(fObTop)
+            array.shift(fObBot)
+            array.shift(fMit)
+            array.shift(fMitBar)
+        else
+            break
+    while array.size(cBar) > 0
+        if array.get(cBar, 0) < cutoff
+            array.shift(cBar)
+            array.shift(cBull)
+            array.shift(cHigh)
+            array.shift(cLow)
+            array.shift(cClose)
+        else
+            break
+    while array.size(shBar) > 0
+        if array.get(shBar, 0) < cutoff
+            array.shift(shPrice), array.shift(shBar), array.shift(shDone), array.shift(shBrk)
+        else
+            break
+    while array.size(slBar) > 0
+        if array.get(slBar, 0) < cutoff
+            array.shift(slPrice), array.shift(slBar), array.shift(slDone), array.shift(slBrk)
+        else
+            break
+
+    // ---- 3) Detection (mode-dependent), iterated over ALL tracked swings
+    if detectMode == "First FVG off Swing"
+        // Bullish OBs: each unresolved swing LOW -> its origin bullish FVG.
+        if array.size(slBar) > 0
+            for s = 0 to array.size(slBar) - 1
+                if not array.get(slDone, s)
+                    sBar = array.get(slBar, s)
+                    legOK = true
+                    if minDispATR > 0 and not na(atrVal)
+                        legHi = array.get(slPrice, s)
+                        if array.size(shPrice) > 0
+                            for h = 0 to array.size(shPrice) - 1
+                                if array.get(shBar, h) > sBar
+                                    legHi := math.max(legHi, array.get(shPrice, h))
+                        legOK := (legHi - array.get(slPrice, s)) >= minDispATR * atrVal
+                    fIdx = f_findOB(true, sBar)
+                    if fIdx >= 0 and legOK
+                        ok = f_registerOB(true, array.get(fAnchor, fIdx), array.get(fObTop, fIdx), array.get(fObBot, fIdx), array.get(fGapTop, fIdx), array.get(fGapBot, fIdx), true, array.get(fMit, fIdx), array.get(fMitBar, fIdx))
+                        if ok
+                            array.set(slDone, s, true)
+
+        // Bearish OBs: mirror over swing HIGHs.
+        if array.size(shBar) > 0
+            for s = 0 to array.size(shBar) - 1
+                if not array.get(shDone, s)
+                    sBar = array.get(shBar, s)
+                    legOK = true
+                    if minDispATR > 0 and not na(atrVal)
+                        legLo = array.get(shPrice, s)
+                        if array.size(slPrice) > 0
+                            for l = 0 to array.size(slPrice) - 1
+                                if array.get(slBar, l) > sBar
+                                    legLo := math.min(legLo, array.get(slPrice, l))
+                        legOK := (array.get(shPrice, s) - legLo) >= minDispATR * atrVal
+                    fIdx = f_findOB(false, sBar)
+                    if fIdx >= 0 and legOK
+                        ok = f_registerOB(false, array.get(fAnchor, fIdx), array.get(fObTop, fIdx), array.get(fObBot, fIdx), array.get(fGapTop, fIdx), array.get(fGapBot, fIdx), true, array.get(fMit, fIdx), array.get(fMitBar, fIdx))
+                        if ok
+                            array.set(shDone, s, true)
+    else
+        // STRUCTURE BREAK (BOS) over all tracked swings.
+        if array.size(shBar) > 0
+            for s = 0 to array.size(shBar) - 1
+                if not array.get(shBrk, s) and close > array.get(shPrice, s)
+                    array.set(shBrk, s, true)
+                    dbgBOSbull := true
+                    int origin = na
+                    if array.size(slBar) > 0
+                        for l = 0 to array.size(slBar) - 1
+                            lb = array.get(slBar, l)
+                            if lb < array.get(shBar, s) and (na(origin) or lb > origin)
+                                origin := lb
+                    legOK = true
+                    if minDispATR > 0 and not na(atrVal) and not na(origin)
+                        legOK := (array.get(shPrice, s) - low) >= minDispATR * atrVal
+                    if not na(origin)
+                        idx = f_findOB(true, origin)
+                        if idx >= 0 and legOK
+                            f_registerOB(true, array.get(fAnchor, idx), array.get(fObTop, idx), array.get(fObBot, idx), array.get(fGapTop, idx), array.get(fGapBot, idx), true, array.get(fMit, idx), array.get(fMitBar, idx))
+                        else if obFallback and legOK
+                            sIdx = f_findStdOB(true, origin)
+                            if sIdx >= 0
+                                aB = array.get(cBar, sIdx)
+                                oT = array.get(cHigh, sIdx)
+                                oB = array.get(cLow, sIdx)
+                                [pm, pmb] = f_scanMit(true, aB, oB, oT)
+                                f_registerOB(true, aB, oT, oB, na, na, false, pm, pmb)
+
+        if array.size(slBar) > 0
+            for s = 0 to array.size(slBar) - 1
+                if not array.get(slBrk, s) and close < array.get(slPrice, s)
+                    array.set(slBrk, s, true)
+                    dbgBOSbear := true
+                    int origin = na
+                    if array.size(shBar) > 0
+                        for h = 0 to array.size(shBar) - 1
+                            hb = array.get(shBar, h)
+                            if hb < array.get(slBar, s) and (na(origin) or hb > origin)
+                                origin := hb
+                    legOK = true
+                    if minDispATR > 0 and not na(atrVal) and not na(origin)
+                        legOK := (high - array.get(slPrice, s)) >= minDispATR * atrVal
+                    if not na(origin)
+                        idx = f_findOB(false, origin)
+                        if idx >= 0 and legOK
+                            f_registerOB(false, array.get(fAnchor, idx), array.get(fObTop, idx), array.get(fObBot, idx), array.get(fGapTop, idx), array.get(fGapBot, idx), true, array.get(fMit, idx), array.get(fMitBar, idx))
+                        else if obFallback and legOK
+                            sIdx = f_findStdOB(false, origin)
+                            if sIdx >= 0
+                                aB = array.get(cBar, sIdx)
+                                oT = array.get(cHigh, sIdx)
+                                oB = array.get(cLow, sIdx)
+                                [pm, pmb] = f_scanMit(false, aB, oB, oT)
+                                f_registerOB(false, aB, oT, oB, na, na, false, pm, pmb)
+
+    // ---- 4) Forward mitigation for ACTIVE drawn boxes (mode-aware)
+    if array.size(obBox) > 0
+        for i = array.size(obBox) - 1 to 0
+            if array.get(obAct, i)
+                ib  = array.get(obBull, i)
+                oT  = array.get(obTop, i)
+                oB  = array.get(obBot, i)
+                oMid = math.avg(oB, oT)
+                mit = mitMode == "50% Touch" ? (ib ? low <= oMid : high >= oMid) : mitMode == "Wick Touch" ? (ib ? low <= oT : high >= oB) : (ib ? close < oB : close > oT)
+                if mit
+                    array.set(obAct, i, false)
+                    bxo = array.get(obBox, i)
+                    bxf = array.get(fvBox, i)
+                    lnM = array.get(obMid, i)
+                    lOB = array.get(obLbl, i)
+                    lFV = array.get(fvLbl, i)
+                    if showMitig
+                        // --- OB box: keep+grey, or hide ---
+                        if showMitOB
+                            if not na(bxo)
+                                box.set_extend(bxo, extend.none)
+                                box.set_right(bxo, bar_index)
+                                box.set_bgcolor(bxo, mitOBCol)
+                                box.set_border_color(bxo, color.new(mitOBCol, 60))
+                            if not na(lnM)
+                                line.set_extend(lnM, extend.none)
+                                line.set_x2(lnM, bar_index)
+                                line.set_color(lnM, color.new(mitOBCol, 40))
+                            if not na(lOB)
+                                label.set_textcolor(lOB, color.new(obTxtCol, 45))
+                        else
+                            if not na(bxo)
+                                box.delete(bxo)
+                                array.set(obBox, i, na)
+                            if not na(lnM)
+                                line.delete(lnM)
+                                array.set(obMid, i, na)
+                            if not na(lOB)
+                                label.delete(lOB)
+                                array.set(obLbl, i, na)
+                        // --- FVG box: keep+grey, or draw fresh, or hide. Independent of group 5. ---
+                        if showMitFVG and array.get(obValid, i)
+                            gT = array.get(obGapT, i)
+                            gB = array.get(obGapB, i)
+                            if na(bxf)
+                                // No box drawn at detection (group 5 off) -> create now, already greyed.
+                                bxf := box.new(array.get(obBar, i), gT, bar_index, gB, border_color = color.new(mitFVGCol, 70), border_width = fvgWidth, bgcolor = mitFVGCol)
+                                array.set(fvBox, i, bxf)
+                            else
+                                box.set_extend(bxf, extend.none)
+                                box.set_right(bxf, bar_index)
+                                box.set_bgcolor(bxf, mitFVGCol)
+                                box.set_border_color(bxf, color.new(mitFVGCol, 70))
+                            if not na(lFV)
+                                label.set_textcolor(lFV, color.new(fvgTxtCol, 45))
+                        else
+                            if not na(bxf)
+                                box.delete(bxf)
+                                array.set(fvBox, i, na)
+                            if not na(lFV)
+                                label.delete(lFV)
+                                array.set(fvLbl, i, na)
+                    else
+                        // Master toggle off -> delete everything for this block.
+                        if not na(bxo)
+                            box.delete(bxo)
+                        if not na(bxf)
+                            box.delete(bxf)
+                        if not na(lnM)
+                            line.delete(lnM)
+                        if not na(lOB)
+                            label.delete(lOB)
+                        if not na(lFV)
+                            label.delete(lFV)
+                        array.remove(obBox, i), array.remove(fvBox, i), array.remove(obMid, i)
+                        array.remove(obLbl, i), array.remove(fvLbl, i), array.remove(obBull, i)
+                        array.remove(obTop, i), array.remove(obBot, i), array.remove(obAct, i)
+                        array.remove(obBar, i), array.remove(obGapT, i), array.remove(obGapB, i)
+                        array.remove(obValid, i)
+
+    // ---- 5) Hard cap stored blocks (oldest out first)
+    while array.size(obBox) > maxOBs
+        b0 = array.get(obBox, 0)
+        if not na(b0)
+            box.delete(b0)
+        f0 = array.get(fvBox, 0)
+        if not na(f0)
+            box.delete(f0)
+        l0 = array.get(obMid, 0)
+        if not na(l0)
+            line.delete(l0)
+        lo0 = array.get(obLbl, 0)
+        if not na(lo0)
+            label.delete(lo0)
+        lf0 = array.get(fvLbl, 0)
+        if not na(lf0)
+            label.delete(lf0)
+        array.shift(obBox), array.shift(fvBox), array.shift(obMid), array.shift(obLbl)
+        array.shift(fvLbl), array.shift(obBull), array.shift(obTop), array.shift(obBot)
+        array.shift(obAct), array.shift(obBar), array.shift(obGapT), array.shift(obGapB)
+        array.shift(obValid)
+
+// ========================[DEVELOPER WATERMARK]==================================================
+var table wmTable = table.new(f_wmPos(wmPos), 1, 3, bgcolor = color.new(color.black, 75), frame_width = 1, frame_color = color.new(color.gray, 60), border_width = 1)
+if barstate.islast
+    table.cell(wmTable, 0, 0, "Dev: MUHAMMAD SHAKIB", text_color = color.white, text_size = size.normal)
+    table.cell(wmTable, 0, 1, "GitHub: 0xSHAK1B", text_color = color.white, text_size = size.small)
+    table.cell(wmTable, 0, 2, "Telegram: @MUH4MM4DSH4KIB", text_color = color.white, text_size = size.small)
+
+
+// ==========================[DEBUG VISUALS]=============================
+bullFVGsig = low > high[2]
+bearFVGsig = high < low[2]
+plotshape(debugMode and bullFVGsig, "Bull FVG", shape.triangleup,   location.belowbar, color.new(color.lime,   0), size = size.tiny)
+plotshape(debugMode and bearFVGsig, "Bear FVG", shape.triangledown, location.abovebar, color.new(color.red,    0), size = size.tiny)
+plotshape(debugMode and not na(ph), "Swing High", shape.circle, location.abovebar, color.new(color.orange, 0), size = size.tiny, offset = -pivotLen)
+plotshape(debugMode and not na(pl), "Swing Low",  shape.circle, location.belowbar, color.new(color.aqua,   0), size = size.tiny, offset = -pivotLen)
+plotshape(debugMode and dbgBOSbull, "Bull BOS", shape.labelup,   location.belowbar, color.new(color.green,  0), text = "BOS", textcolor = color.white, size = size.tiny)
+plotshape(debugMode and dbgBOSbear, "Bear BOS", shape.labeldown, location.abovebar, color.new(color.maroon, 0), text = "BOS", textcolor = color.white, size = size.tiny)
